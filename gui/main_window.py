@@ -8,12 +8,14 @@ import os
 import shutil
 import ast
 import time
+import smtplib
+from email.message import EmailMessage
 
 class MainWindow:
     def __init__(self, root):
         self.root = root
         self.root.title("Infotainment Test Automation Tool")
-        self.root.geometry("900x750")
+        self.root.geometry("900x800")
 
         self.result_manager = ResultManager()
         self.last_run_results = []
@@ -27,17 +29,42 @@ class MainWindow:
         self.test_vars = {}
         self.load_test_cases()
 
-        upload_button = ttk.Button(self.root, text="📤 Upload Test Script", command=self.upload_test_script)
-        upload_button.pack(pady=5)
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(pady=10)
 
-        run_button = ttk.Button(self.root, text="Run Selected Tests", command=self.run_selected_tests)
-        run_button.pack(pady=5)
+        remove_button = ttk.Button(button_frame, text="🗑️ Remove Selected", command=self.remove_selected_tests)
+        remove_button.pack(side="left", padx=5)
 
-        export_button = ttk.Button(self.root, text="Export CSV Report", command=self.export_results)
-        export_button.pack(pady=5)
 
-        clear_button = ttk.Button(self.root, text="Clear Output", command=self.clear_output)
-        clear_button.pack(pady=5)
+        clear_selection_button = ttk.Button(button_frame, text="❎ Clear Selection", command=self.clear_test_selection)
+        clear_selection_button.pack(side="left", padx=5)
+
+
+        upload_button = ttk.Button(button_frame, text="📤 Upload Test Script", command=self.upload_test_script)
+        upload_button.pack(side="left", padx=5)
+
+        run_button = ttk.Button(button_frame, text="▶️ Run Selected Tests", command=self.run_selected_tests)
+        run_button.pack(side="left", padx=5)
+
+
+        export_button = ttk.Button(button_frame, text="💾 Export CSV Report", command=self.export_results)
+        export_button.pack(side="left", padx=5)
+
+        clear_button = ttk.Button(button_frame, text="🧹 Clear Output", command=self.clear_output)
+        clear_button.pack(side="left", padx=5)
+
+        save_logs_button = ttk.Button(button_frame, text="💾 Save Logs", command=self.save_logs)
+        save_logs_button.pack(side="left", padx=5)
+
+
+        email_frame = ttk.LabelFrame(self.root, text="📧 Email Report")
+        email_frame.pack(pady=10, fill="x")
+
+        ttk.Label(email_frame, text="Recipient Email:").pack(side="left", padx=5)
+        self.email_entry = ttk.Entry(email_frame, width=40)
+        self.email_entry.pack(side="left", padx=5)
+        send_button = ttk.Button(email_frame, text="Send CSV Report", command=self.send_email_report)
+        send_button.pack(side="left", padx=5)
 
         filter_frame = ttk.Frame(self.root)
         filter_frame.pack(pady=5)
@@ -78,13 +105,21 @@ class MainWindow:
             self.test_vars[test_name] = var
 
     def upload_test_script(self):
-        file_path = filedialog.askopenfilename(title="Select Test Script", filetypes=[("Python files", "*.py")])
-        if file_path:
+        file_paths = filedialog.askopenfilename(title="Select Test Script", filetypes=[("Python files", "*.py")])
+        if not file_paths:
+            return
+
+        uploaded = 0
+        skipped = 0
+
+        for file_path in file_paths:
             try:
                 file_name = os.path.basename(file_path)
                 if not file_name.startswith("test_") or not file_name.endswith(".py"):
-                    messagebox.showwarning("Invalid File", "Test script must start with 'test_' and end with '.py'")
-                    return
+                    skipped+=1
+                    continue
+                    #messagebox.showwarning("Invalid File", "Test script must start with 'test_' and end with '.py'")
+                    #return
 
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
@@ -92,21 +127,30 @@ class MainWindow:
                 try:
                     parsed = ast.parse(content)
                 except SyntaxError as e:
-                    messagebox.showerror("Syntax Error", f"Syntax error in script on line {e.lineno}: {e.msg}")
-                    return
+                    messagebox.showerror("Syntax Error", f"Syntax error in script on line {file_name} -{e.lineno}: {e.msg}")
+                    skipped+=1
+                    continue
+                    #return
 
                 has_run = any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in parsed.body)
                 if not has_run:
-                    messagebox.showerror("Missing Function", "The script must contain a 'run()' function.")
-                    return
+                    messagebox.showerror("Missing run() Function", f"{file_name} does not contain a 'run()' method.")
+                    skipped+=1
+                    continue
+                    #return
 
                 dest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
                 dest_path = os.path.join(dest_dir, file_name)
                 shutil.copy(file_path, dest_path)
+                uploaded+=1
                 self.load_test_cases()
 
             except Exception as e:
-                messagebox.showerror("Upload Failed", f"Failed to upload script:\n{str(e)}")
+                messagebox.showerror("Upload Failed", f"Failed to upload script{file_name}:\n{str(e)}")
+                skipped+=1
+
+        self.load_test_cases()
+        messagebox.showinfo("Upload Summary", f"✅ Uploaded: {uploaded}\n⛔ Skipped: {skipped}")        
 
     def run_selected_tests(self):
         selected_tests = [name for name, var in self.test_vars.items() if var.get()]
@@ -115,33 +159,40 @@ class MainWindow:
             return
 
         runner = TestRunner()
-        self.output_box.delete(1.0, tk.END)
+       
         self.table.delete(*self.table.get_children())
         self.last_run_results.clear()
 
         for test_name in selected_tests:
             try:
-                output, passed, log_path = runner.run_test(test_name)
+                summary_output, passed, raw_output = runner.run_test(test_name)
                 status = "PASS" if passed else "FAIL"
 
                 log_entry = {
-                    "test": test_name,
-                    "status": status,
-                    "output": output.strip(),
-                    "log_path": log_path
+                        "test": test_name,
+                        "status": status,
+                        "output": summary_output.strip(),      # GUI
+                        "raw_output": raw_output.strip(),      # Log
+                        "log_path": None,
+                        "log_saved": False
                 }
                 self.last_run_results.append(log_entry)
+                
 
                 log_line = (
                     f"[{status}] {test_name}:\n"
-                    f"{output.strip()}\n"
-                    f"📁 Log saved to: {log_path}\n\n"
+                    f"{summary_output.strip()}\n\n"
+                    
                 )
                 self.output_box.insert(tk.END, log_line)
                 self.output_box.see(tk.END)
 
-                self.result_manager.add_result(test_name, status, log_path)
-                self.table.insert("", "end", values=(test_name, status, log_path))
+                self.table.insert("","end",values=(test_name , status ,"Not saved yet"))
+
+                #self.result_manager.add_result(test_name, status, log_path)
+                #self.table.insert("", "end", values=(test_name, status, log_path))
+                #self.last_run_results.append(log_entry)
+
 
             except Exception as e:
                 error_message = f"❌ Error running {test_name}: {str(e)}\n"
@@ -149,6 +200,68 @@ class MainWindow:
                 self.output_box.see(tk.END)
 
         self.refresh_log_dropdown()
+
+
+    def save_logs(self):
+        saved=0
+        if not self.last_run_results:
+            messagebox.showwarning("No Results", "Please run some tests before saving logs.")
+            return 
+
+        for result in self.last_run_results:
+            if result.get("log_saved"):
+                continue
+            log_file_name =f"{result['test']}_{int(time.time())}.log"
+            log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
+            os.makedirs(log_dir, exist_ok=True)
+            
+            log_path = os.path.join(log_dir, log_file_name)
+
+            try:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(result.get("raw_output", result["output"]))
+                result["log_path"] = log_path  # update log path
+                result["log_saved"]=True
+                saved+=1
+            except Exception as e:
+                messagebox.showerror("Save Failed", f"Could not save log for {result['test']}:\n{str(e)}")
+        if saved:
+            messagebox.showinfo("Logs Saved", "✅ All test logs have been saved to the logs folder.")
+        else:
+            messagebox.showinfo("Logs already Saved", "✅ All logs were already saved .")
+
+
+        self.refresh_log_dropdown()
+        self.show_all_results()       
+
+
+
+    def send_email_report(self):
+        recipient = self.email_entry.get().strip()
+        if not recipient:
+            messagebox.showerror("Missing Email", "Please enter a recipient email address.")
+            return
+
+        csv_path = self.result_manager.export_to_csv()
+
+        try:
+            msg = EmailMessage()
+            msg['Subject'] = "Infotainment Test Report"
+            msg['From'] = "your_email@gmail.com"  # Replace with your sender email
+            msg['To'] = recipient
+            msg.set_content("Please find the attached test report.")
+
+            with open(csv_path, "rb") as f:
+                msg.add_attachment(f.read(), maintype="text", subtype="csv", filename=os.path.basename(csv_path))
+
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                smtp.login("manohargc2650@gmail.com", "llcsmmpjggxebgej")  # Replace with app password
+                smtp.send_message(msg)
+
+            messagebox.showinfo("Email Sent", f"✅ Report sent to {recipient}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to send email:\n{str(e)}")
 
     def export_results(self):
         filepath = self.result_manager.export_to_csv()
@@ -172,13 +285,14 @@ class MainWindow:
                 self.display_result(result)
 
     def display_result(self, result):
+        log_display = result["log_path"] if result.get("log_saved") else "Not saved"
         log_line = (
             f"[{result['status']}] {result['test']}:\n"
             f"{result['output']}\n"
-            f"📁 Log saved to: {result['log_path']}\n\n"
+            f"📁 Log saved to: {'log_display'}\n\n"
         )
         self.output_box.insert(tk.END, log_line)
-        self.table.insert("", "end", values=(result['test'], result['status'], result['log_path']))
+        self.table.insert("", "end", values=(result['test'], result['status'], log_display))
 
     def refresh_log_dropdown(self):
         log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
@@ -201,3 +315,64 @@ class MainWindow:
                 self.output_box.insert(tk.END, f"📂 Viewing log: {selected_log}\n\n{content}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load log:\n{str(e)}")
+
+
+    def clear_test_selection(self):
+        for var in self.test_vars.values():
+            var.set(False)
+
+
+
+    def remove_selected_tests(self):
+        selected_to_remove = [name for name, var in self.test_vars.items() if var.get()]
+        if not selected_to_remove:
+            messagebox.showinfo("No Selection", "Please select test cases to remove.")
+            return
+
+        confirm = messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(selected_to_remove)} test file(s)?")
+        if not confirm:
+            return
+
+        removed = 0
+        failed = []
+
+        test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
+
+        for test_name in selected_to_remove:
+            try:
+                file_path = os.path.join(test_dir, f"{test_name}.py")
+               
+
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    removed += 1
+                    print(f"✅ Deleted: {file_path}")
+                else:
+                    print(f"❌ File not found: {file_path}")
+                    failed.append(test_name)
+
+            
+
+            # Remove .pyc from __pycache__ (optional)
+                pycache_dir = os.path.join(test_dir, "__pycache__")
+                if os.path.exists(pycache_dir):
+                    for fname in os.listdir(pycache_dir):
+                        if fname.startswith(test_name)and fname.endswith(".pyc"):
+                            os.remove(os.path.join(pycache_dir, fname))
+
+            except Exception as e:
+                print(f"⚠️ Error deleting {test_name}: {e}")
+                failed.append(test_name)
+
+    # ✅ Reload available test cases UI
+        self.load_test_cases()
+
+        messagebox.showinfo("Remove Complete", f"🗑️ Removed: {removed}\n❌ Failed: {len(failed)}")
+
+
+    def show_all_results(self):
+        self.output_box.delete(1.0, tk.END)
+        self.table.delete(*self.table.get_children())
+        for result in self.last_run_results:
+            self.display_result(result)
+   

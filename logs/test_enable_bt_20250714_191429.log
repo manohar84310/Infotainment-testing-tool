@@ -1,1 +1,0 @@
-Bluetooth test failed: Command '['adb', 'shell', 'service call bluetooth_manager 6']' returned non-zero exit status 1.
