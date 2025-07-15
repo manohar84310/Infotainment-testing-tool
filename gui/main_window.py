@@ -4,6 +4,11 @@ from core.result_manager import ResultManager
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from core.test_runner import TestRunner
+import importlib
+import inspect
+import io
+import contextlib
+import traceback
 import os
 import shutil
 import ast
@@ -56,6 +61,11 @@ class MainWindow:
         save_logs_button = ttk.Button(button_frame, text="💾 Save Logs", command=self.save_logs)
         save_logs_button.pack(side="left", padx=5)
 
+        pie_button = ttk.Button(button_frame, text="📊 Show Pass/Fail Pie",
+                        command=self.show_pass_fail_pie)
+        pie_button.pack(side="left", padx=5)
+
+
 
         email_frame = ttk.LabelFrame(self.root, text="📧 Email Report")
         email_frame.pack(pady=10, fill="x")
@@ -90,13 +100,17 @@ class MainWindow:
         self.table.heading("Log", text="Log File")
         self.table.pack(padx=10, pady=10, fill="x")
 
+
     def load_test_cases(self):
         self.test_vars = {}
         for widget in self.test_frame.winfo_children():
             widget.destroy()
 
         test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
-        test_files = [f[:-3] for f in os.listdir(test_dir) if f.startswith("test_") and f.endswith(".py")]
+        if not os.path.exists(test_dir):
+            os.makedirs(test_dir)
+        test_files = [f[:-3] for f in os.listdir(test_dir)
+                      if f.startswith("test_") and f.endswith(".py")]
 
         for test_name in sorted(test_files):
             var = tk.BooleanVar()
@@ -104,101 +118,160 @@ class MainWindow:
             cb.pack(anchor="w", padx=10, pady=2)
             self.test_vars[test_name] = var
 
+
+
+
     def upload_test_script(self):
-        file_paths = filedialog.askopenfilename(title="Select Test Script", filetypes=[("Python files", "*.py")])
-        if not file_paths:
+        # pick any number of Python files
+        file_paths = filedialog.askopenfilenames(
+            title="Select Test Scripts",
+            filetypes=[("Python files", "*.py")]
+        )
+        if not file_paths:               # user hit cancel
             return
 
-        uploaded = 0
-        skipped = 0
+        uploaded = skipped = 0
+        dest_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tests")
+        )
+        os.makedirs(dest_dir, exist_ok=True)
 
         for file_path in file_paths:
+            file_name = os.path.basename(file_path)
             try:
-                file_name = os.path.basename(file_path)
-                if not file_name.startswith("test_") or not file_name.endswith(".py"):
-                    skipped+=1
+                # ---- basic filename rule ----------------------------------
+                if not (file_name.startswith("test_") and file_name.endswith(".py")):
+                    skipped += 1
                     continue
-                    #messagebox.showwarning("Invalid File", "Test script must start with 'test_' and end with '.py'")
-                    #return
 
+                # ---- read + parse -----------------------------------------
                 with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                    source = f.read()
 
                 try:
-                    parsed = ast.parse(content)
+                    parsed = ast.parse(source)            # <- parsed **used**
                 except SyntaxError as e:
-                    messagebox.showerror("Syntax Error", f"Syntax error in script on line {file_name} -{e.lineno}: {e.msg}")
-                    skipped+=1
+                    skipped += 1
+                    messagebox.showerror(
+                        "Syntax Error",
+                        f"'{file_name}' skipped – line {e.lineno}: {e.msg}"
+                    )
                     continue
-                    #return
 
-                has_run = any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in parsed.body)
+                # ---- must contain at least one run*() ---------------------
+                has_run = any(
+                    isinstance(node, ast.FunctionDef) and node.name.startswith("run")
+                    for node in ast.walk(parsed)           # <- parsed **used**
+                )
                 if not has_run:
-                    messagebox.showerror("Missing run() Function", f"{file_name} does not contain a 'run()' method.")
-                    skipped+=1
+                    skipped += 1
+                    messagebox.showwarning(
+                        "No run() found",
+                        f"'{file_name}' skipped – it has no function starting with 'run'."
+                    )
                     continue
-                    #return
 
-                dest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
-                dest_path = os.path.join(dest_dir, file_name)
-                shutil.copy(file_path, dest_path)
-                uploaded+=1
-                self.load_test_cases()
+                # ---- copy to tests/ --------------------------------------
+                shutil.copy(file_path, os.path.join(dest_dir, file_name))
+                uploaded += 1
 
             except Exception as e:
-                messagebox.showerror("Upload Failed", f"Failed to upload script{file_name}:\n{str(e)}")
-                skipped+=1
+                skipped += 1
+                messagebox.showerror(
+                    "Upload Failed",
+                    f"Failed to upload '{file_name}':\n{e}"
+                )
 
+        # refresh UI and show summary
         self.load_test_cases()
-        messagebox.showinfo("Upload Summary", f"✅ Uploaded: {uploaded}\n⛔ Skipped: {skipped}")        
+        messagebox.showinfo(
+            "Upload Summary",
+            f"✅ Uploaded: {uploaded}\n⛔ Skipped: {skipped}"
+        )
+
 
     def run_selected_tests(self):
+        # ---------------- collect selected test modules -----------------
         selected_tests = [name for name, var in self.test_vars.items() if var.get()]
         if not selected_tests:
-            messagebox.showwarning("No Selection", "Please select at least one test case.")
+            messagebox.showwarning("No Selection",
+                                   "Please select at least one test case.")
             return
 
-        runner = TestRunner()
-       
+        # ---------------- clear previous output -------------------------
         self.table.delete(*self.table.get_children())
         self.last_run_results.clear()
 
+        # ---------------- iterate over each test_<name>.py --------------
         for test_name in selected_tests:
             try:
-                summary_output, passed, raw_output = runner.run_test(test_name)
-                status = "PASS" if passed else "FAIL"
+                # import / reload the module
+                module = importlib.import_module(f"tests.{test_name}")
+                importlib.reload(module)
 
-                log_entry = {
-                        "test": test_name,
-                        "status": status,
-                        "output": summary_output.strip(),      # GUI
-                        "raw_output": raw_output.strip(),      # Log
+                # discover every function whose name begins with 'run'
+                run_funcs = [
+                    fn for _, fn in inspect.getmembers(module, inspect.isfunction)
+                    if fn.__name__.startswith("run")
+                ]
+                run_funcs.sort(key=lambda f: f.__name__)          # deterministic order
+
+                if not run_funcs:
+                    messagebox.showerror(
+                        "No run() functions",
+                        f"No function starting with 'run' found in {test_name}.py"
+                    )
+                    continue
+
+                # --------------- execute each run*() --------------------
+                for fn in run_funcs:
+                    fn_name = fn.__name__
+                    buf = io.StringIO()
+
+                    with contextlib.redirect_stdout(buf):
+                        try:
+                            result = fn()                          # user code runs
+                            passed = bool(result) if result is not None else True
+                        except Exception:
+                            passed = False
+                            traceback.print_exc()                  # into buf
+
+                    raw_output     = buf.getvalue().strip()
+                    status         = "PASS" if passed else "FAIL"
+                    summary_output = f"{fn_name}: {status}"
+
+                    # ---------- store result for later save/export -----
+                    log_entry = {
+                        "test":    f"{test_name}.{fn_name}",
+                        "status":  status,
+                        "output":  summary_output,
+                        "raw_output": raw_output,
                         "log_path": None,
-                        "log_saved": False
-                }
-                self.last_run_results.append(log_entry)
-                
+                        "log_saved": False,
+                    }
+                    self.last_run_results.append(log_entry)
 
-                log_line = (
-                    f"[{status}] {test_name}:\n"
-                    f"{summary_output.strip()}\n\n"
-                    
-                )
-                self.output_box.insert(tk.END, log_line)
-                self.output_box.see(tk.END)
+                    # ---------- update GUI output box ------------------
+                    log_line = (
+                        f"[{status}] {test_name}.{fn_name}\n"
+                        f"{raw_output}\n\n"
+                    )
+                    self.output_box.insert(tk.END, log_line)
+                    self.output_box.see(tk.END)
 
-                self.table.insert("","end",values=(test_name , status ,"Not saved yet"))
-
-                #self.result_manager.add_result(test_name, status, log_path)
-                #self.table.insert("", "end", values=(test_name, status, log_path))
-                #self.last_run_results.append(log_entry)
-
+                    # ---------- add row to table -----------------------
+                    self.table.insert(
+                        "",
+                        "end",
+                        values=(f"{test_name}.{fn_name}", status, "Not saved yet")
+                    )
 
             except Exception as e:
-                error_message = f"❌ Error running {test_name}: {str(e)}\n"
+                error_message = f"❌ Error running {test_name}: {e}\n"
                 self.output_box.insert(tk.END, error_message)
                 self.output_box.see(tk.END)
 
+        # refresh log dropdown when all tests are finished
         self.refresh_log_dropdown()
 
 
@@ -376,3 +449,47 @@ class MainWindow:
         for result in self.last_run_results:
             self.display_result(result)
    
+       # ---------------------------------------------------------------------
+    #  Pie‑chart of pass / fail results
+    # ---------------------------------------------------------------------
+    def show_pass_fail_pie(self):
+        """
+        Open a small window with a pie chart of PASS vs FAIL based on
+        self.last_run_results.  Call this after running tests.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        if not self.last_run_results:
+            messagebox.showinfo("No Data", "Run some tests first.")
+            return
+
+        # ----- count results ---------------------------------------------
+        pass_count = sum(1 for r in self.last_run_results if r["status"] == "PASS")
+        fail_count = sum(1 for r in self.last_run_results if r["status"] == "FAIL")
+
+        # avoid zero‑division
+        if pass_count + fail_count == 0:
+            messagebox.showinfo("No Results", "No PASS/FAIL data to plot.")
+            return
+
+        # ----- create figure ---------------------------------------------
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.pie(
+            [pass_count, fail_count],
+            labels=[f"PASS ({pass_count})", f"FAIL ({fail_count})"],
+            autopct="%1.0f%%",
+            startangle=90,
+        )
+        ax.set_title("Test‑case Result Distribution")
+
+        # ----- embed in a new Tk window ----------------------------------
+        pie_win = tk.Toplevel(self.root)
+        pie_win.title("PASS vs FAIL")
+        canvas = FigureCanvasTkAgg(fig, master=pie_win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # optional: close matplotlib figure when the Tk window closes
+        pie_win.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig), pie_win.destroy()))
+
