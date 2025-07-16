@@ -161,7 +161,10 @@ class MainWindow:
         ttk.Button(button_frame, text="📁 Save Logs", command=self.save_logs).pack(side="left", padx=5)
         ttk.Button(button_frame, text="📊 Dashboard", command=self.show_dashboard).pack(side="left", padx=5)
 
-        # Email section
+        save_logs_button = ttk.Button(button_frame, text="💾 Save Logs", command=self.save_logs)
+        save_logs_button.pack(side="left", padx=5)
+
+
         email_frame = ttk.LabelFrame(self.root, text="📧 Email Report")
         email_frame.pack(pady=10, fill="x")
 
@@ -202,28 +205,41 @@ class MainWindow:
         self.table.heading("Log", text="Log File")
         self.table.pack(padx=10, pady=10, fill="x")
 
+    def load_test_cases(self):
+        self.test_vars = {}
+        for widget in self.test_frame.winfo_children():
+            widget.destroy()
+
+        test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
+        test_files = [f[:-3] for f in os.listdir(test_dir) if f.startswith("test_") and f.endswith(".py")]
+
+        for test_name in sorted(test_files):
+            var = tk.BooleanVar()
+            cb = ttk.Checkbutton(self.test_frame, text=test_name, variable=var)
+            cb.pack(anchor="w", padx=10, pady=2)
+            self.test_vars[test_name] = var
+
     def upload_test_script(self):
-        file_paths = filedialog.askopenfilenames(
-            title="Select Test Scripts",
-            filetypes=[("Python files", "*.py")]
-        )
+        file_paths = filedialog.askopenfilename(title="Select Test Script", filetypes=[("Python files", "*.py")])
         if not file_paths:
             return
 
-        uploaded = skipped = 0
+        uploaded = 0
+        skipped = 0
 
         for file_path in file_paths:
-            file_name = os.path.basename(file_path)
             try:
-                if not (file_name.startswith("test_") and file_name.endswith(".py")):
-                    skipped += 1
+                file_name = os.path.basename(file_path)
+                if not file_name.startswith("test_") or not file_name.endswith(".py"):
+                    skipped+=1
                     continue
 
+                # ---- read + parse -----------------------------------------
                 with open(file_path, "r", encoding="utf-8") as f:
                     source = f.read()
 
                 try:
-                    parsed = ast.parse(source)
+                    parsed = ast.parse(content)
                 except SyntaxError as e:
                     skipped += 1
                     messagebox.showerror(
@@ -231,11 +247,9 @@ class MainWindow:
                         f"'{file_name}' skipped – line {e.lineno}: {e.msg}"
                     )
                     continue
+                    #return
 
-                has_run = any(
-                    isinstance(node, ast.FunctionDef) and node.name.startswith("run")
-                    for node in ast.walk(parsed)
-                )
+                has_run = any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in parsed.body)
                 if not has_run:
                     skipped += 1
                     messagebox.showwarning(
@@ -243,82 +257,69 @@ class MainWindow:
                         f"'{file_name}' skipped – it has no function starting with 'run'."
                     )
                     continue
+                    #return
 
-                display_name = file_name[:-3]
-                var = tk.BooleanVar()
-                cb = ttk.Checkbutton(self.test_frame, text=display_name, variable=var)
-                cb.pack(anchor="w", padx=10, pady=2)
-
-                self.test_vars[display_name] = {
-                    "selected": var,
-                    "path": file_path
-                }
-
-                uploaded += 1
+                dest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests"))
+                dest_path = os.path.join(dest_dir, file_name)
+                shutil.copy(file_path, dest_path)
+                uploaded+=1
+                self.load_test_cases()
 
             except Exception as e:
-                skipped += 1
-                messagebox.showerror("Upload Failed", f"Failed to upload '{file_name}':\n{e}")
+                messagebox.showerror("Upload Failed", f"Failed to upload script{file_name}:\n{str(e)}")
+                skipped+=1
 
-        messagebox.showinfo("Upload Summary", f"✅ Uploaded: {uploaded}\n⛔ Skipped: {skipped}")
+        self.load_test_cases()
+        messagebox.showinfo("Upload Summary", f"✅ Uploaded: {uploaded}\n⛔ Skipped: {skipped}")        
 
     def run_selected_tests(self):
-        selected = [name for name, meta in self.test_vars.items() if meta["selected"].get()]
-        if not selected:
+        selected_tests = [name for name, var in self.test_vars.items() if var.get()]
+        if not selected_tests:
             messagebox.showwarning("No Selection", "Please select at least one test case.")
             return
 
-        self.output_box.delete(1.0, tk.END)
+        runner = TestRunner()
+       
         self.table.delete(*self.table.get_children())
         self.last_run_results.clear()
 
-        for test_name in selected:
-            file_path = self.test_vars[test_name]["path"]
+        for test_name in selected_tests:
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    code = f.read()
-
-                namespace = {}
-                exec(code, namespace)
-
-                run_functions = [fn for fn in namespace if fn.startswith("run") and callable(namespace[fn])]
-                if not run_functions:
-                    raise Exception("No run_*() functions found.")
-
-                combined_output = []
-                passed = True
-
-                for fn in run_functions:
-                    try:
-                        result = namespace[fn]()
-                        msg = f"{fn}() => {'PASS' if result else 'FAIL'}"
-                        combined_output.append(msg)
-                        if not result:
-                            passed = False
-                    except Exception as inner_e:
-                        combined_output.append(f"{fn}() => ERROR: {inner_e}")
-                        passed = False
-
+                summary_output, passed, raw_output = runner.run_test(test_name)
                 status = "PASS" if passed else "FAIL"
-                output_text = "\n".join(combined_output)
-                log_entry = f"[{status}] {test_name}:\n{output_text}\n\n"
 
-                self.output_box.insert(tk.END, log_entry)
+                log_entry = {
+                        "test": test_name,
+                        "status": status,
+                        "output": summary_output.strip(),      # GUI
+                        "raw_output": raw_output.strip(),      # Log
+                        "log_path": None,
+                        "log_saved": False
+                }
+                self.last_run_results.append(log_entry)
+                
+
+                log_line = (
+                    f"[{status}] {test_name}:\n"
+                    f"{summary_output.strip()}\n\n"
+                    
+                )
+                self.output_box.insert(tk.END, log_line)
                 self.output_box.see(tk.END)
 
-                self.table.insert("", "end", values=(test_name, status, ""))
+                self.table.insert("","end",values=(test_name , status ,"Not saved yet"))
 
-                self.last_run_results.append({
-                    "test": test_name,
-                    "status": status,
-                    "output": output_text,
-                    "log_path": ""
-                })
+                #self.result_manager.add_result(test_name, status, log_path)
+                #self.table.insert("", "end", values=(test_name, status, log_path))
+                #self.last_run_results.append(log_entry)
+
 
             except Exception as e:
-                error_text = f"❌ Error running {test_name}: {e}\n"
-                self.output_box.insert(tk.END, error_text)
+                error_message = f"❌ Error running {test_name}: {str(e)}\n"
+                self.output_box.insert(tk.END, error_message)
                 self.output_box.see(tk.END)
+
+        self.refresh_log_dropdown()
 
 
     def save_logs(self):
@@ -494,143 +495,3 @@ class MainWindow:
         for result in self.last_run_results:
             self.display_result(result)
    
-       # ---------------------------------------------------------------------
-    #  Pie‑chart of pass / fail results
-    # ---------------------------------------------------------------------
-    def show_dashboard(self):
-        """
-        Open a small window with a pie chart of PASS vs FAIL based on
-        self.last_run_results.  Call this after running tests.
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-        if not self.last_run_results:
-            messagebox.showinfo("No Data", "Run some tests first.")
-            return
-
-        # ----- count results ---------------------------------------------
-        pass_count = sum(1 for r in self.last_run_results if r["status"] == "PASS")
-        fail_count = sum(1 for r in self.last_run_results if r["status"] == "FAIL")
-
-        # avoid zero‑division
-        if pass_count + fail_count == 0:
-            messagebox.showinfo("No Results", "No PASS/FAIL data to plot.")
-            return
-
-        # ----- create figure ---------------------------------------------
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.pie(
-            [pass_count, fail_count],
-            labels=[f"PASS ({pass_count})", f"FAIL ({fail_count})"],
-            autopct="%1.0f%%",
-            startangle=90,
-        )
-        ax.set_title("Test‑case Result Distribution")
-
-        # ----- embed in a new Tk window ----------------------------------
-        pie_win = tk.Toplevel(self.root)
-        pie_win.title("PASS vs FAIL")
-        canvas = FigureCanvasTkAgg(fig, master=pie_win)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        # optional: close matplotlib figure when the Tk window closes
-        pie_win.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig), pie_win.destroy()))
-
-
-
-    def refresh_log_dropdown(self):
-        log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        log_files = sorted(os.listdir(log_dir), reverse=True)
-        self.log_dropdown['values'] = log_files[:20]  # Show latest 20
-        self.log_var.set("")  # Clear selection
-
-    def load_selected_log(self, event):
-        selected_log = self.log_var.get()
-        if not selected_log:
-            return
-        log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
-        log_path = os.path.join(log_dir, selected_log)
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            self.output_box.delete(1.0, tk.END)
-            self.output_box.insert(tk.END, f"📂 Viewing log: {selected_log}\n\n{content}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load log:\n{str(e)}")
-
-
-    def update_table_with_logs(self):
-    # Clear the table and repopulate with updated log paths
-        self.table.delete(*self.table.get_children())
-        for result in self.last_run_results:
-            self.table.insert("", "end", values=(result["test"], result["status"], result["log_path"]))
-
-
-    # def run_selected_tests(self):
-    #     selected = [name for name, var in self.test_vars.items() if var.get()]
-    #     if not selected:
-    #         messagebox.showwarning("No Selection", "Please select at least one test case.")
-    #         return
-
-    #     self.output_box.delete(1.0, tk.END)
-    #     self.table.delete(*self.table.get_children())
-    #     self.last_run_results.clear()
-
-    #     for test_name in selected:
-    #         file_path = self.test_vars[test_name]["path"]
-    #         try:
-    #             with open(file_path, "r", encoding="utf-8") as f:
-    #                 code = f.read()
-
-    #             namespace = {}
-    #             exec(code, namespace)
-
-    #             run_functions = [fn for fn in namespace if fn.startswith("run") and callable(namespace[fn])]
-    #             if not run_functions:
-    #                 raise Exception("No run_*() functions found.")
-
-    #             combined_output = []
-    #             passed = True
-
-    #             for fn in run_functions:
-    #                 try:
-    #                     result = namespace[fn]()
-    #                     if result:
-    #                         msg = f"✅ {fn}() PASSED"
-    #                     else:
-    #                         msg = f"❌ {fn}() FAILED — returned False"
-    #                         passed = False
-    #                     combined_output.append(msg)
-    #                 except AssertionError as ae:
-    #                     msg = f"❌ {fn}() ASSERTION FAILED: {ae}"
-    #                     combined_output.append(msg)
-    #                     passed = False
-    #                 except Exception as e:
-    #                     msg = f"❌ {fn}() CRASHED:\n{traceback.format_exc()}"
-    #                     combined_output.append(msg)
-    #                     passed = False
-
-    #             status = "PASS" if passed else "FAIL"
-    #             output_text = "\n".join(combined_output)
-    #             log_line = f"[{status}] {test_name}\n{'='*40}\n{output_text}\n\n"
-
-    #             self.output_box.insert(tk.END, log_line)
-    #             self.output_box.see(tk.END)
-
-    #             self.last_run_results.append({
-    #                 "test": test_name,
-    #                 "status": status,
-    #                 "output": log_line,
-    #                 "log_path": ""
-    #             })
-
-    #             self.table.insert("", "end", values=(test_name, status, ""))
-
-    #         except Exception as e:
-    #             error_log = f"❌ Error running {test_name}:\n{traceback.format_exc()}"
-    #             self.output_box.insert(tk.END, error_log)
-    #             self.output_box.see(tk.END)
